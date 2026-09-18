@@ -1,0 +1,494 @@
+################################################################################
+# TERRAFORM IMPORT PLAN
+# Case study: ClickOps AWS lab → Terraform (no downtime rebuild)
+#
+# What this file is
+#   A runbook of discovery, import, and remediation commands for the Phase 1
+#   console-built AWS footprint described in case_study_aws_azure_engineer.md.
+#   Import puts live resources into Terraform state. It does not change AWS.
+#   Hardening happens only after import, via terraform plan / apply.
+#
+# Golden rule (do not skip)
+#   1. Write Terraform that MATCHES the live resources as they exist today
+#      (open SSH, unencrypted S3, admin IAM user, messy names/tags).
+#   2. Import into state.
+#   3. Confirm terraform plan is empty (no create/destroy/update).
+#   4. THEN change the .tf files to the desired secure design and apply
+#      in small, reviewable steps.
+#
+# If you write the hardened config first and then import, the next apply will
+# try to "fix" everything at once (replace instances, rewrite S3, delete the
+# IAM user). That is how you cause an outage during a live migration.
+#
+# Assumed layout after Phase 2 scaffolding exists:
+#   terraform/
+#     main.tf                  # module calls + provider + default_tags
+#     variables.tf
+#     backend.tf               # S3 + DynamoDB remote state (bootstrap first)
+#     modules/network/
+#     modules/compute/
+#     modules/storage/
+#     modules/iam/
+#
+# Fill in the REPLACE_ME_* values from the discovery section before running
+# any import. IAM users, S3 buckets, and VPC IDs are account-specific.
+#
+# Run all terraform commands from the terraform/ directory unless noted.
+################################################################################
+
+
+################################################################################
+# 0. PRE-FLIGHT — do this before any import
+################################################################################
+
+# Confirm you are in the intended AWS account and region. Importing into the
+# wrong account/region will fail or, worse, bind the wrong IDs if names collide.
+aws sts get-caller-identity
+aws configure get region
+
+# Optional: pin the region for this shell so CLI and Terraform stay aligned.
+# export AWS_REGION=us-east-1
+# export AWS_DEFAULT_REGION=us-east-1
+
+# Remote state must exist BEFORE you start importing application resources.
+# Local terraform.tfstate on a laptop is the same tribal-knowledge problem
+# the case study is trying to kill. Bootstrap bucket + lock table by hand
+# (or a separate bootstrap root) and do not import those into this stack.
+# Example names — change them; they must be globally unique for S3:
+#   bucket:  REPLACE_ME_TFSTATE_BUCKET
+#   table:   REPLACE_ME_TFLOCK_TABLE
+#   key:     dexian-lab/aws/terraform.tfstate
+
+# After backend.tf is written:
+terraform init
+
+# Sanity: no state yet for the app stack (or you are adding to a known empty workspace).
+terraform state list
+
+
+################################################################################
+# 1. DISCOVERY — inventory the ClickOps resources (Phase 1)
+#
+# Phase 1 created, by hand:
+#   - 1 VPC + 1 public subnet (and usually an IGW + public route table)
+#   - 1 EC2 instance + 1 security group with SSH 0.0.0.0/0
+#   - 1 S3 bucket (no versioning, no block public access, no tags)
+#   - 1 IAM user with AdministratorAccess
+#
+# Console-created VPCs also create an internet gateway and a route table even
+# if you never named them. Import those too or Terraform will try to create
+# duplicates on the first apply.
+################################################################################
+
+# --- Networking ---
+aws ec2 describe-vpcs --query "Vpcs[].{Id:VpcId,Cidr:CidrBlock,Default:IsDefault,Tags:Tags}" --output table
+
+# Copy the non-default VPC you built in Phase 1:
+#   VPC_ID=vpc-REPLACE_ME
+
+aws ec2 describe-subnets --filters "Name=vpc-id,Values=vpc-REPLACE_ME" \
+  --query "Subnets[].{Id:SubnetId,Cidr:CidrBlock,Az:AvailabilityZone,Public:MapPublicIpOnLaunch,Tags:Tags}" --output table
+#   SUBNET_ID=subnet-REPLACE_ME
+
+aws ec2 describe-internet-gateways --filters "Name=attachment.vpc-id,Values=vpc-REPLACE_ME" \
+  --query "InternetGateways[].InternetGatewayId" --output text
+#   IGW_ID=igw-REPLACE_ME
+
+aws ec2 describe-route-tables --filters "Name=vpc-id,Values=vpc-REPLACE_ME" \
+  --query "RouteTables[].{Id:RouteTableId,Main:Associations[0].Main,Routes:Routes}" --output json
+# Identify the PUBLIC route table (has 0.0.0.0/0 -> igw-...). Not the main/local-only table.
+#   RTB_ID=rtb-REPLACE_ME
+
+# --- Compute / security group ---
+aws ec2 describe-instances --filters "Name=vpc-id,Values=vpc-REPLACE_ME" "Name=instance-state-name,Values=running,stopped" \
+  --query "Reservations[].Instances[].{Id:InstanceId,Type:InstanceType,Ami:ImageId,Sg:SecurityGroups,Subnet:SubnetId}" --output table
+#   INSTANCE_ID=i-REPLACE_ME
+#   AMI_ID=ami-REPLACE_ME          # pin this in variables.tf after import
+#   SG_ID=sg-REPLACE_ME
+
+aws ec2 describe-security-groups --group-ids sg-REPLACE_ME --output json
+# Confirm the inbound rule is tcp/22 from 0.0.0.0/0. Your FIRST terraform config
+# must declare that same rule so plan is empty. You tighten it in section 5.
+
+# --- Storage ---
+aws s3api list-buckets --query "Buckets[].Name" --output table
+#   BUCKET_NAME=REPLACE_ME_APP_ASSETS_BUCKET
+
+aws s3api get-bucket-location --bucket REPLACE_ME_APP_ASSETS_BUCKET
+aws s3api get-public-access-block --bucket REPLACE_ME_APP_ASSETS_BUCKET
+aws s3api get-bucket-versioning --bucket REPLACE_ME_APP_ASSETS_BUCKET
+aws s3api get-bucket-encryption --bucket REPLACE_ME_APP_ASSETS_BUCKET
+# Expect: no public-access block, versioning Disabled/empty, encryption error or AES256 default
+# depending on account date. Match whatever the API actually returns in your .tf.
+
+# --- IAM ---
+aws iam list-users --query "Users[].UserName" --output table
+#   IAM_USER=REPLACE_ME_APP_USER
+
+aws iam list-attached-user-policies --user-name REPLACE_ME_APP_USER
+# Expect: arn:aws:iam::aws:policy/AdministratorAccess
+
+# Write the IDs into a local (gitignored) env file so imports are repeatable:
+#   echo "export VPC_ID=vpc-..." >> .env.import
+# Never commit live account IDs, bucket names that are unique to prod, or keys.
+
+
+################################################################################
+# 2. AUTHOR THE MATCHING CONFIG (not the desired config)
+#
+# Resource addresses below assume these module resources exist:
+#
+#   module "network" {
+#     source = "./modules/network"
+#     ...
+#   }
+#   # inside modules/network:
+#   resource "aws_vpc" "this" { ... }
+#   resource "aws_subnet" "public" { ... }
+#   resource "aws_internet_gateway" "this" { ... }
+#   resource "aws_route_table" "public" { ... }
+#   resource "aws_route_table_association" "public" { ... }
+#
+#   module "compute" {
+#     source = "./modules/compute"
+#     ...
+#   }
+#   # inside modules/compute:
+#   resource "aws_security_group" "instance" { ... }
+#   resource "aws_instance" "app" { ... }
+#
+#   module "storage" {
+#     source = "./modules/storage"
+#     ...
+#   }
+#   # inside modules/storage:
+#   resource "aws_s3_bucket" "app_assets" { ... }
+#
+#   module "iam" {
+#     source = "./modules/iam"
+#     ...
+#   }
+#   # inside modules/iam — IMPORT the existing user first; the role comes later:
+#   resource "aws_iam_user" "app" { name = "REPLACE_ME_APP_USER" }
+#   resource "aws_iam_user_policy_attachment" "admin" {
+#     user       = aws_iam_user.app.name
+#     policy_arn = "arn:aws:iam::aws:policy/AdministratorAccess"
+#   }
+#
+# Matching-config checklist (must be true before import):
+#   [ ] CIDR, AZ, MapPublicIpOnLaunch match the live subnet
+#   [ ] SG ingress/egress match live rules (including 0.0.0.0/0 SSH)
+#   [ ] aws_instance ami, type, subnet, sg, and public-ip flag match
+#   [ ] S3 bucket name matches exactly (bucket names are the import ID)
+#   [ ] IAM user name matches exactly
+#   [ ] provider default_tags is EMPTY or already present on every resource
+#       (new default_tags will show as in-place tag updates on the first plan)
+#
+# terraform validate
+# terraform fmt
+################################################################################
+
+
+################################################################################
+# 3. IMPORT — binds live objects to resource addresses. No AWS mutations.
+#
+# Syntax (Terraform 1.5+):
+#   terraform import [options] ADDRESS ID
+#
+# ADDRESS = the resource as Terraform knows it (module.path.resource.name)
+# ID      = the provider's import ID (not always the Name tag)
+#
+# Quote addresses on Windows Git Bash / PowerShell when they contain brackets.
+################################################################################
+
+# --- 3a. Network (keep the live VPC; do not recreate it) ---
+
+# Attach the ClickOps VPC to module.network.aws_vpc.this.
+# Import ID for aws_vpc is the VPC ID.
+terraform import module.network.aws_vpc.this vpc-REPLACE_ME
+
+# Attach the public subnet. Import ID is the subnet ID.
+terraform import module.network.aws_subnet.public subnet-REPLACE_ME
+
+# Attach the internet gateway. Import ID is the IGW ID.
+# The IGW must already be attached to this VPC in AWS (it will be, from the console wizard).
+terraform import module.network.aws_internet_gateway.this igw-REPLACE_ME
+
+# Attach the public route table. Import ID is the route table ID.
+terraform import module.network.aws_route_table.public rtb-REPLACE_ME
+
+# Associate subnet ↔ public route table.
+# Import ID format is:  SUBNET_ID/ROUTE_TABLE_ID
+terraform import module.network.aws_route_table_association.public subnet-REPLACE_ME/rtb-REPLACE_ME
+
+# Default VPC security group, DHCP options, and the MAIN route table:
+# leave them unmanaged unless you declared them in the module. Unmanaged
+# default objects are normal. Do not import aws_default_security_group unless
+# you intend Terraform to police it forever.
+
+
+# --- 3b. Compute ---
+
+# Security group. Import ID is sg-xxxxxxxx.
+# Inline ingress/egress on aws_security_group come along with the group.
+# If you split rules into aws_vpc_security_group_ingress_rule resources,
+# those are SEPARATE addresses and need their own imports (rule IDs).
+# This plan assumes rules are inline on aws_security_group.instance to match
+# a typical console-created group.
+terraform import module.compute.aws_security_group.instance sg-REPLACE_ME
+
+# EC2 instance. Import ID is i-xxxxxxxx.
+# EBS root volume is imported WITH the instance for aws_instance when you
+# use root_block_device in config. Extra data volumes are NOT — add
+# aws_ebs_volume + aws_volume_attachment and import those separately if
+# the console attached extra disks (Phase 1 lab typically has only root).
+terraform import module.compute.aws_instance.app i-REPLACE_ME
+
+
+# --- 3c. Storage (the resource the case study explicitly says to practice) ---
+
+# S3 bucket. Import ID is the bucket name, not an ARN.
+terraform import module.storage.aws_s3_bucket.app_assets REPLACE_ME_APP_ASSETS_BUCKET
+
+# Modern AWS provider splits bucket settings into sibling resources.
+# Import ONLY the ones you declared in the matching config. If you did not
+# declare them yet, skip these — then add them in section 5 as remediations
+# (that will be creates in AWS, which is what we want for missing blocks).
+
+# Public access block — import ID is the bucket name.
+# terraform import module.storage.aws_s3_bucket_public_access_block.app_assets REPLACE_ME_APP_ASSETS_BUCKET
+
+# Versioning — import ID is the bucket name.
+# terraform import module.storage.aws_s3_bucket_versioning.app_assets REPLACE_ME_APP_ASSETS_BUCKET
+
+# Server-side encryption config — import ID is the bucket name.
+# terraform import module.storage.aws_s3_bucket_server_side_encryption_configuration.app_assets REPLACE_ME_APP_ASSETS_BUCKET
+
+# Ownership controls / ACL — only if they already exist in AWS AND in .tf:
+# terraform import module.storage.aws_s3_bucket_ownership_controls.app_assets REPLACE_ME_APP_ASSETS_BUCKET
+
+
+# --- 3d. IAM (existing over-privileged user — import, then replace) ---
+
+# IAM user. Import ID is the user name.
+terraform import module.iam.aws_iam_user.app REPLACE_ME_APP_USER
+
+# Managed policy attachment. Import ID is:  USER_NAME/POLICY_ARN
+terraform import module.iam.aws_iam_user_policy_attachment.admin \
+  REPLACE_ME_APP_USER/arn:aws:iam::aws:policy/AdministratorAccess
+
+# Access keys: do NOT import them. You cannot rotate or inspect secret material
+# through import. Disable/delete keys in the console after the instance role
+# exists (section 5d). If Terraform creates aws_iam_access_key, it will make
+# NEW keys, not adopt the old ones.
+
+
+################################################################################
+# 4. VERIFY THE IMPORT — plan must be empty (or tags-only if default_tags slipped in)
+################################################################################
+
+# List everything now in state. Compare 1:1 with the discovery inventory.
+terraform state list
+
+# Show one object to confirm IDs look like AWS, not placeholders.
+terraform state show module.storage.aws_s3_bucket.app_assets
+terraform state show module.compute.aws_instance.app
+
+# The important command: a refresh-only plan, then a normal plan.
+terraform plan -refresh-only
+terraform plan
+
+# SUCCESS looks like: "No changes. Your infrastructure matches the configuration."
+#
+# If you see Create: you declared something that does not exist in AWS (or
+#   forgot to import it). Import it or remove it from .tf.
+# If you see Destroy: the address is in state but not in .tf, OR you changed
+#   a ForceNew argument (AMI, subnet, bucket name). Fix the config to match
+#   live; do not apply.
+# If you see Update in-place: usually tags, SG description, or S3 attributes
+#   that differ. Either relax the .tf to match live, or accept the update as
+#   a tiny first apply — never mix this with instance replacement.
+#
+# terraform apply is allowed here ONLY if the plan is empty or you have
+# reviewed a tags-only in-place update. Do not apply creates/destroys yet.
+
+
+################################################################################
+# 5. CORRECT THE INFRASTRUCTURE — after state is truthful
+#
+# Order is security-first, then identity, then quality-of-life (tags/names).
+# One concern per plan/apply so the diff is explainable in a PR / interview.
+################################################################################
+
+# -----------------------------------------------------------------------------
+# 5a. Storage hardening (safe in-place on the imported bucket)
+# -----------------------------------------------------------------------------
+# Edit modules/storage:
+#   - aws_s3_bucket_public_access_block: all four Block* = true
+#   - aws_s3_bucket_versioning: status = "Enabled"
+#   - aws_s3_bucket_server_side_encryption_configuration: SSE-S3 (AES256)
+#     or SSE-KMS if the account already has a CMK
+#   - optional: aws_s3_bucket_policy denying insecure transport (aws:SecureTransport)
+#
+# These are NEW resources (creates), not a bucket rebuild, as long as the
+# bucket name is unchanged.
+#
+# terraform plan   # expect creates of the sibling S3 resources only
+# terraform apply
+
+# -----------------------------------------------------------------------------
+# 5b. Network tagging standard (in-place)
+# -----------------------------------------------------------------------------
+# Add Name / Environment / Owner via default_tags on the provider or a
+# tags = merge(var.tags, { Name = ... }) on vpc, subnet, igw, rtb, sg.
+# terraform plan   # expect update in-place on tags
+# terraform apply
+# Do not change CIDR or AZ here — those ForceNew the subnet/VPC.
+
+# -----------------------------------------------------------------------------
+# 5c. Lock down the security group (in-place)
+# -----------------------------------------------------------------------------
+# Replace ingress 0.0.0.0/0:22 with EITHER:
+#   - your /32 only, OR
+#   - no inbound SSH at all + SSM (preferred).
+#
+# SSM path (preferred, matches "security baked in"):
+#   1. Add aws_iam_role + instance profile with AmazonSSMManagedInstanceCore
+#      (this is the NEW role in module.iam — creates, not imports).
+#   2. Attach the profile to the instance (may ForceNew on aws_instance
+#      depending on provider version / existing profile). If the plan says
+#      replace the instance, stop and use:
+#        aws ec2 associate-iam-instance-profile ...
+#      then import aws_iam_instance_profile and set iam_instance_profile
+#      in config so the next plan is in-place.
+#   3. Confirm SSM online: aws ssm describe-instance-information
+#   4. THEN remove the SSH ingress rule and apply.
+#
+# terraform plan   # expect SG rule update; must NOT destroy the VPC
+# terraform apply
+
+# -----------------------------------------------------------------------------
+# 5d. Replace the admin IAM user with a scoped instance role
+# -----------------------------------------------------------------------------
+# Goal: EC2 talks to THAT ONE bucket; no long-lived admin access keys.
+#
+# 1. Add module.iam resources (creates):
+#      aws_iam_role.ec2_app
+#      aws_iam_role_policy.s3_app_assets   # s3:GetObject/PutObject/ListBucket
+#                                          # on arn:aws:s3:::BUCKET and /* only
+#      aws_iam_instance_profile.ec2_app
+# 2. Attach profile to the instance (see 5c).
+# 3. Prove the app path with the role (read/write one test object).
+# 4. Detach AdministratorAccess, then remove the user from Terraform:
+#      terraform destroy -target=module.iam.aws_iam_user_policy_attachment.admin
+#      terraform destroy -target=module.iam.aws_iam_user.app
+#    Deleting the user is intentional. It was never a workload identity.
+# 5. Delete leftover access keys in IAM if the destroy did not (keys not in state).
+#
+# Never terraform import AdministratorAccess itself — it is an AWS managed policy.
+
+# -----------------------------------------------------------------------------
+# 5e. Pin the AMI and decide whether to replace the instance
+# -----------------------------------------------------------------------------
+# Record the imported AMI in variables.tf with a comment: date last validated.
+# Console "latest Amazon Linux" is not a lifecycle process.
+#
+# If the imported AMI is acceptable for the lab:
+#   leave aws_instance.app.ami = var.ami_id and do not change it.
+#
+# If you must move to a known-good AMI:
+#   changing ami ForceNew → instance REPLACE. That is a mini-cutover:
+#     - confirm SSM/role/SG are already correct
+#     - terraform plan  (look for -/+)
+#     - apply in a window; public IP will change unless you use an EIP
+#
+# Case study guidance: import S3 (and network if you want zero-downtime
+# addressing); destroy/recreate compute when the AMI is untrusted.
+
+# -----------------------------------------------------------------------------
+# 5f. Optional: Elastic IP so a later instance replace does not move DNS
+# -----------------------------------------------------------------------------
+# If the messy instance already has an EIP:
+#   terraform import module.compute.aws_eip.app eipalloc-REPLACE_ME
+# Then aws_eip_association. If it has only a public IP (not an EIP), that
+# address is not importable as a stable object — allocate an EIP now, associate
+# it, then import.
+
+
+################################################################################
+# 6. RESOURCES YOU SHOULD NOT IMPORT (recreate or leave unmanaged)
+################################################################################
+
+# - Default VPC / default subnets — data sources, not this stack.
+# - Terraform state bucket and DynamoDB lock table — separate bootstrap state.
+# - IAM access keys and Secrets — generate new, disable old.
+# - AWS managed policies (AdministratorAccess) — attach by ARN only.
+# - Console "launch-wizard-*" leftover SGs from aborted launches — delete by
+#   hand after you confirm nothing uses them:
+#     aws ec2 describe-security-groups --query "SecurityGroups[?starts_with(GroupName, 'launch-wizard')]"
+# - Random unnamed ENIs from stopped instances — delete after instance cleanup.
+
+
+################################################################################
+# 7. WHAT "DONE" LOOKS LIKE
+################################################################################
+
+# terraform state list
+#   shows vpc, subnet, igw, rtb, rtb assoc, sg, instance, s3 bucket +
+#   hardening siblings, iam ROLE + instance profile (user is gone)
+#
+# terraform plan
+#   No changes
+#
+# Live AWS:
+#   [ ] S3: Block Public Access on, versioning on, encryption on
+#   [ ] SG: no 0.0.0.0/0 SSH (SSM or /32 only)
+#   [ ] IAM: no app user with AdministratorAccess; instance role scoped to bucket
+#   [ ] Tags: Name, Environment, Owner on every managed resource
+#   [ ] AMI ID pinned in code with a validation date comment
+#
+# That is the case study's "relabel the shelves without stopping deliveries":
+# import first, then apply the standard, then the next environment is a module
+# call instead of another afternoon in the console.
+
+
+################################################################################
+# 8. OPTIONAL AZURE MIRROR (same process, different IDs)
+# Only after the AWS import/remediation path is proven.
+################################################################################
+
+# Discovery:
+#   az account show
+#   az group list -o table
+#   az network vnet list -o table
+#   az storage account list -o table
+#
+# Matching azurerm resources, then:
+#   terraform import module.network_az.azurerm_resource_group.this /subscriptions/SUB/resourceGroups/RG
+#   terraform import module.network_az.azurerm_virtual_network.this /subscriptions/SUB/resourceGroups/RG/providers/Microsoft.Network/virtualNetworks/VNET
+#   terraform import module.storage_az.azurerm_storage_account.this /subscriptions/SUB/resourceGroups/RG/providers/Microsoft.Storage/storageAccounts/SA
+#
+# Same golden rule: match live (shared key enabled, public blob) → import →
+# empty plan → then disable shared key, add RBAC, set public_network_access
+# to Disabled or firewall-only, encryption defaults already on in Azure.
+#
+# Import IDs for Azure are full resource IDs, not short names.
+
+
+################################################################################
+# 9. ROLLBACK / IF IMPORT GOES WRONG
+################################################################################
+
+# Import only writes state. To undo a bad import WITHOUT touching AWS:
+#   terraform state rm ADDRESS
+# Example:
+#   terraform state rm module.compute.aws_instance.app
+#
+# Then fix the .tf address or the ID and import again.
+#
+# Do not terraform destroy to "undo an import" — destroy deletes the real
+# VPC / instance / bucket.
+#
+# If state and AWS diverge badly:
+#   terraform plan -refresh-only
+#   terraform refresh     # older alias; prefer plan -refresh-only then apply -refresh-only
