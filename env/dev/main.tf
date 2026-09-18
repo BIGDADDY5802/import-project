@@ -1,3 +1,12 @@
+terraform {
+  required_providers {
+    tls = {
+      source  = "hashicorp/tls"
+      version = "~> 4.0"
+    }
+  }
+}
+
 provider "aws" {
   region = "us-east-1"
 }
@@ -32,4 +41,19 @@ module "network" {
   availability_zone   = var.availability_zone
   vpc_name            = var.vpc_name
   subnet_name         = var.subnet_name
+}
+
+module "oidc" {
+  source        = "../../modules/oidc"
+  github_org    = var.github_org
+  github_repo   = var.github_repo
+  github_branch = "main"
+}
+
+module "jenkins" {
+  source        = "../../modules/jenkins"
+  environment   = var.environment
+  vpc_id        = module.network.vpc_id
+  subnet_id     = module.network.subnet_id
+  admin_ip_cidr = var.admin_ip_cidr
 }

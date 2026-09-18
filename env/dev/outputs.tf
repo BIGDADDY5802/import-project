@@ -13,3 +13,11 @@ output "vpc_id" {
 output "security_group_id" {
   value = module.network.security_group_id
 }
+
+output "cicd_role_arn" {
+  value = module.oidc.cicd_role_arn
+}
+
+output "jenkins_public_ip" {
+  value = module.jenkins.jenkins_public_ip
+}
