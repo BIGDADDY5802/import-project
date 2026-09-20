@@ -434,5 +434,12 @@ terraform apply
 - **Second subnet** (`us-east-1a`) in the same VPC — not yet imported; nothing currently depends on it.
 
 ---
+```bash
+$aws ssm get-parameter \
+  --name "/jenkins/initial-admin-password" \
+  --with-decryption \
+  --region us-east-1 \
+  --query Parameter.Value --output text
+```
 
 *This log reflects a personal lab environment built for interview preparation. Account IDs, IP addresses, and resource identifiers have been redacted.*

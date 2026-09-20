@@ -4,6 +4,12 @@ terraform {
       source  = "hashicorp/tls"
       version = "~> 4.0"
     }
+
+    local = {
+      source  = "hashicorp/local"
+      version = "~> 2.0"
+    }
+
   }
 }
 
@@ -24,23 +30,23 @@ module "iam" {
 }
 
 module "compute" {
-  source                       = "../../modules/compute"
-  environment                  = var.environment
-  instance_profile_name        = module.iam.instance_profile_name
-  subnet_id                    = module.network.subnet_id
-  security_group_id            = module.network.security_group_id
-  route_table_association_id   = module.network.route_table_association_id
+  source                     = "../../modules/compute"
+  environment                = var.environment
+  instance_profile_name      = module.iam.instance_profile_name
+  subnet_id                  = module.network.subnet_id
+  security_group_id          = module.network.security_group_id
+  route_table_association_id = module.network.route_table_association_id
 }
 
 module "network" {
-  source              = "../../modules/network"
-  environment         = var.environment
-  admin_ip_cidr       = var.admin_ip_cidr
-  vpc_cidr            = var.vpc_cidr
-  subnet_cidr         = var.subnet_cidr
-  availability_zone   = var.availability_zone
-  vpc_name            = var.vpc_name
-  subnet_name         = var.subnet_name
+  source            = "../../modules/network"
+  environment       = var.environment
+  admin_ip_cidr     = var.admin_ip_cidr
+  vpc_cidr          = var.vpc_cidr
+  subnet_cidr       = var.subnet_cidr
+  availability_zone = var.availability_zone
+  vpc_name          = var.vpc_name
+  subnet_name       = var.subnet_name
 }
 
 module "oidc" {

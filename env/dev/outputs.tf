@@ -21,3 +21,23 @@ output "cicd_role_arn" {
 output "jenkins_public_ip" {
   value = module.jenkins.jenkins_public_ip
 }
+
+output "jenkins_instance_id" {
+  value = module.jenkins.jenkins_instance_id
+}
+
+output "ssh_command" {
+  value = "ssh -i ${abspath("${path.root}/../../modules/jenkins/keys/jenkins_id_ed25519")} ec2-user@${module.jenkins.jenkins_public_ip}"
+}
+
+output "ssm_session_command" {
+  value = "aws ssm start-session --target ${module.jenkins.jenkins_instance_id}"
+}
+
+output "ssm_status_command" {
+  value = "aws ssm describe-instance-information --filters \"Key=InstanceIds,Values=${module.jenkins.jenkins_instance_id}\" --output table"
+}
+
+output "jenkins_url" {
+  value = "http://${module.jenkins.jenkins_public_ip}:8080"
+}

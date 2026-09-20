@@ -29,6 +29,13 @@ override.tf.json
 .terraformrc
 terraform.rc
 
+# Private keys and key material — never commit these
+*.pem
+*_id_ed25519
+*_id_rsa
+*.key
+keys/
+
 # Ignore lock file variance across OS/architectures (optional — many teams DO commit this one)
 .terraform.lock.hcl
 

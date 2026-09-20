@@ -19,6 +19,7 @@ sudo yum update -y
 # Install essential binaries
 # git     — required by Jenkins to clone repos
 # python3 — required by various Jenkins plugins and scripts
+# wget    — needed to fetch the Jenkins repo file and plugin manager jar
 # --------------------------------------
 echo "[1b/10] Installing essential binaries..."
 sudo yum install -y git python3 wget
@@ -92,6 +93,7 @@ sudo yum install java-21-amazon-corretto -y
 echo "[6/10] Installing Jenkins..."
 sudo yum install jenkins -y
 
+
 # --------------------------------------
 # Install Terraform CLI
 # Needed for the terraform Jenkins plugin to actually have a binary to call
@@ -100,6 +102,7 @@ echo "[6b/10] Installing Terraform CLI..."
 sudo yum install -y dnf-plugins-core
 sudo dnf config-manager --add-repo https://rpm.releases.hashicorp.com/AmazonLinux/hashicorp.repo
 sudo yum install -y terraform
+
 
 # =============================================================================
 # Plugin Installation
@@ -195,29 +198,84 @@ echo "[8/10] Enabling Jenkins service..."
 sudo systemctl enable jenkins
 
 
+# =============================================================================
+# Skip the setup wizard entirely — generate and store the admin password
+# BEFORE Jenkins ever starts, then create the account via a Groovy init
+# script. Idempotent: safe to run on every boot without erroring or
+# duplicating the account.
+# =============================================================================
+
+echo "[8b/10] Generating and storing admin password..."
+ADMIN_PASSWORD=$(openssl rand -base64 24)
+
+aws ssm put-parameter \
+  --name "/jenkins/initial-admin-password" \
+  --value "$ADMIN_PASSWORD" \
+  --type "SecureString" \
+  --overwrite \
+  --region us-east-1
+
+echo "[8c/10] Configuring Jenkins to skip setup wizard..."
+sudo mkdir -p /var/lib/jenkins/init.groovy.d
+echo "2.0" | sudo tee /var/lib/jenkins/jenkins.install.UpgradeWizard.state
+echo "2.0" | sudo tee /var/lib/jenkins/jenkins.install.InstallUtil.lastExecVersion
+
+sudo tee /var/lib/jenkins/init.groovy.d/basic-security.groovy > /dev/null << GROOVY
+import jenkins.model.*
+import hudson.security.*
+
+def instance = Jenkins.getInstance()
+def hudsonRealm = instance.getSecurityRealm()
+
+if (!(hudsonRealm instanceof HudsonPrivateSecurityRealm) || !hudsonRealm.getAllUsers().find { it.id == 'admin' }) {
+  def newRealm = new HudsonPrivateSecurityRealm(false)
+  newRealm.createAccount('admin', '${ADMIN_PASSWORD}')
+  instance.setSecurityRealm(newRealm)
+
+  def strategy = new FullControlOnceLoggedInAuthorizationStrategy()
+  strategy.setAllowAnonymousRead(false)
+  instance.setAuthorizationStrategy(strategy)
+
+  instance.save()
+  println "Admin account created."
+} else {
+  println "Admin account already exists — skipping."
+}
+GROOVY
+
+sudo chown -R jenkins:jenkins /var/lib/jenkins/init.groovy.d
+
+
 # --------------------------------------
 # Start the Jenkins service
 # --------------------------------------
 echo "[9/10] Starting Jenkins..."
 sudo systemctl start jenkins
 
+
 # --------------------------------------
-# Write initial admin password to SSM
-# so it can be retrieved via terraform output
+# Wait for Jenkins to actually come up, then remove the Groovy init script.
+# It only needs to exist for this one boot — once the admin account is
+# created, leaving a plaintext password sitting in init.groovy.d forever
+# is an unnecessary, easily-forgotten exposure. The password itself
+# remains retrievable from SSM for anyone who legitimately needs it.
 # --------------------------------------
-echo "[post-start] Waiting for initial admin password..."
-until [ -f /var/lib/jenkins/secrets/initialAdminPassword ]; do
+echo "[9b/10] Waiting for Jenkins to come up before cleaning up init script..."
+RETRIES=0
+until curl -s -o /dev/null http://localhost:8080/login || [ "$RETRIES" -ge 60 ]; do
   sleep 5
+  RETRIES=$((RETRIES + 1))
 done
 
-aws ssm put-parameter \
-  --name "/jenkins/initial-admin-password" \
-  --value "$(sudo cat /var/lib/jenkins/secrets/initialAdminPassword)" \
-  --type "SecureString" \
-  --overwrite \
-  --region us-east-1
+if curl -s -o /dev/null http://localhost:8080/login; then
+  sudo rm -f /var/lib/jenkins/init.groovy.d/basic-security.groovy
+  echo "[9b/10] Groovy init script removed — admin account already created."
+else
+  echo "WARNING: Jenkins did not respond within the wait window — leaving init script in place for retry on next restart."
+fi
 
 echo "============================================"
 echo " Jenkins bootstrap complete."
-echo " Admin password written to SSM: /jenkins/initial-admin-password"
+echo " Admin username: admin"
+echo " Admin password stored in SSM: /jenkins/initial-admin-password"
 echo "============================================"
